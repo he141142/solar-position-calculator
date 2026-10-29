@@ -1,0 +1,90 @@
+name: build-and-deploy
+
+# push main  -> tự động deploy dev
+# chạy tay   -> chọn stg/prd; GitHub environment của stg/prd đặt required reviewers để có bước duyệt
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, stg, prd]
+        default: dev
+
+permissions:
+  id-token: write # OIDC -> AWS, không dùng access key
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  # Hợp đồng với solar-infra (config/contracts.go) - đổi ở đó thì đổi ở đây.
+  ECR_REPOSITORY: solar/position-calculator
+  FUNCTION_NAME: solar-position-calculator
+  GOPRIVATE: github.com/he141142/*
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Access private Go modules (solar-shared)
+        env:
+          TOKEN: ${{ secrets.GO_MODULES_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Build binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags lambda.norpc -ldflags="-s -w" -o dist/bootstrap .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    concurrency: deploy-${{ inputs.environment || 'dev' }}
+    env:
+      ENV_TAG: ${{ inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }} # output PositionCalculatorDeployRoleArn của <env>-trading foundation
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true # repo public: không để lộ account ID trong log
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build & push image (:<sha> bất biến, :<env> trỏ tới bản đang chạy)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker build --platform linux/amd64 --provenance=false -t "$IMAGE:$GITHUB_SHA" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$ENV_TAG"
+          docker push "$IMAGE:$ENV_TAG"
+          echo "IMAGE_URI=$IMAGE:$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Update Lambda
+        run: |
+          if ! aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "::warning::$FUNCTION_NAME does not exist yet. Image is pushed; deploy the trading app layer in solar-infra."
+            exit 0
+          fi
+          aws lambda update-function-code --function-name "$FUNCTION_NAME" --image-uri "$IMAGE_URI" >/dev/null
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          echo "Deployed $IMAGE_URI to $FUNCTION_NAME ($ENV_TAG)"
